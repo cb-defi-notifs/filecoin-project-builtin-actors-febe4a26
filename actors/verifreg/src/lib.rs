@@ -6,6 +6,7 @@ use frc46_token::token::types::{BurnParams, TransferParams};
 use frc46_token::token::TOKEN_PRECISION;
 use fvm_actor_utils::receiver::UniversalReceiverParams;
 use fvm_ipld_blockstore::Blockstore;
+use fvm_ipld_encoding::ipld_block::IpldBlock;
 use fvm_ipld_encoding::RawBytes;
 use fvm_ipld_hamt::BytesKey;
 use fvm_shared::address::Address;
@@ -14,12 +15,15 @@ use fvm_shared::bigint::BigInt;
 use fvm_shared::clock::ChainEpoch;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ExitCode;
-use fvm_shared::{ActorID, HAMT_BIT_WIDTH, METHOD_CONSTRUCTOR};
+use fvm_shared::event::{ActorEvent, Entry, Flags};
+use fvm_shared::sys::SendFlags;
+use fvm_shared::{ActorID, HAMT_BIT_WIDTH, IPLD_RAW, METHOD_CONSTRUCTOR};
 use log::info;
 use num_derive::FromPrimitive;
 use num_traits::{Signed, Zero};
+use serde::Serialize;
 
-use fil_actors_runtime::cbor::deserialize;
+use fil_actors_runtime::cbor::{deserialize, serialize};
 use fil_actors_runtime::runtime::builtins::Type;
 use fil_actors_runtime::runtime::{ActorCode, Policy, Runtime};
 use fil_actors_runtime::{
@@ -29,8 +33,7 @@ use fil_actors_runtime::{
     VERIFIED_REGISTRY_ACTOR_ADDR,
 };
 use fil_actors_runtime::{ActorContext, AsActorError, BatchReturnGen};
-use fvm_ipld_encoding::ipld_block::IpldBlock;
-use fvm_shared::sys::SendFlags;
+use crate::events::{ClaimEvent, EVENT_VERIFIER_BALANCE};
 
 use crate::ext::datacap::{DestroyParams, MintParams};
 
@@ -42,6 +45,7 @@ pub use self::types::*;
 #[cfg(feature = "fil-actor")]
 fil_actors_runtime::wasm_trampoline!(Actor);
 
+pub mod events;
 pub mod expiration;
 pub mod ext;
 pub mod state;
@@ -103,31 +107,36 @@ impl Actor {
         }
 
         let verifier = resolve_to_actor_id(rt, &params.address, true)?;
-        let verifier = Address::new_id(verifier);
+        let verifier_addr = Address::new_id(verifier);
 
         let st: State = rt.state()?;
         rt.validate_immediate_caller_is(std::iter::once(&st.root_key))?;
 
         // Disallow root as a verifier.
-        if verifier == st.root_key {
+        if verifier_addr == st.root_key {
             return Err(actor_error!(illegal_argument, "Rootkey cannot be added as verifier"));
         }
 
         // Disallow existing clients as verifiers.
-        let token_balance = balance(rt, &verifier)?;
+        let token_balance = balance(rt, &verifier_addr)?;
         if token_balance.is_positive() {
             return Err(actor_error!(
                 illegal_argument,
                 "verified client {} cannot become a verifier",
-                verifier
+                verifier_addr
             ));
         }
 
         // Store the new verifier and allowance (over-writing).
         rt.transaction(|st: &mut State, rt| {
-            st.put_verifier(rt.store(), &verifier, &params.allowance)
+            st.put_verifier(rt.store(), &verifier_addr, &params.allowance)
                 .context("failed to add verifier")
-        })
+        })?;
+        emit_event(
+            rt,
+            EVENT_VERIFIER_BALANCE,
+            &[events::VerifierBalanceEvent { verifier, new_balance: params.allowance }],
+        )
     }
 
     pub fn remove_verifier(
@@ -135,12 +144,17 @@ impl Actor {
         params: RemoveVerifierParams,
     ) -> Result<(), ActorError> {
         let verifier = resolve_to_actor_id(rt, &params.verifier, false)?;
-        let verifier = Address::new_id(verifier);
+        let verifier_addr = Address::new_id(verifier);
 
         rt.transaction(|st: &mut State, rt| {
             rt.validate_immediate_caller_is(std::iter::once(&st.root_key))?;
-            st.remove_verifier(rt.store(), &verifier).context("failed to remove verifier")
-        })
+            st.remove_verifier(rt.store(), &verifier_addr).context("failed to remove verifier")
+        })?;
+        emit_event(
+            rt,
+            EVENT_VERIFIER_BALANCE,
+            &[events::VerifierBalanceEvent { verifier, new_balance: DataCap::zero() }],
+        )
     }
 
     pub fn add_verified_client(
@@ -168,10 +182,11 @@ impl Actor {
             }
 
             // Validate caller is one of the verifiers, i.e. has an allowance (even if zero).
-            let verifier = rt.message().caller();
-            let verifier_cap = st
-                .get_verifier_cap(rt.store(), &verifier)?
-                .ok_or_else(|| actor_error!(not_found, "caller {} is not a verifier", verifier))?;
+            let verifier_addr = rt.message().caller();
+            let verifier_cap =
+                st.get_verifier_cap(rt.store(), &verifier_addr)?.ok_or_else(|| {
+                    actor_error!(not_found, "caller {} is not a verifier", verifier_addr)
+                })?;
 
             // Disallow existing verifiers as clients.
             if st.get_verifier_cap(rt.store(), &client)?.is_some() {
@@ -194,8 +209,14 @@ impl Actor {
 
             // Reduce verifier's cap.
             let new_verifier_cap = verifier_cap - &params.allowance;
-            st.put_verifier(rt.store(), &verifier, &new_verifier_cap)
-                .context("failed to update verifier allowance")
+            st.put_verifier(rt.store(), &verifier_addr, &new_verifier_cap)
+                .context("failed to update verifier allowance")?;
+            let verifier = verifier_addr.id().unwrap();
+            emit_event(
+                rt,
+                EVENT_VERIFIER_BALANCE,
+                &[events::VerifierBalanceEvent { verifier, new_balance: new_verifier_cap }],
+            )
         })?;
 
         // Credit client token allowance.
@@ -380,8 +401,7 @@ impl Actor {
         }
 
         let provider = rt.message().caller().id().unwrap();
-        let mut total_datacap_claimed = DataCap::zero();
-        let mut sector_claims = Vec::new();
+        let mut maybe_claims = Vec::new();
 
         rt.transaction(|st: &mut State, rt| {
             let mut claims = st.load_claims(rt.store())?;
@@ -399,7 +419,7 @@ impl Actor {
                             "no allocation {} for client {}",
                             claim_alloc.allocation_id, claim_alloc.client,
                         );
-                        sector_claims.push(SectorAllocationClaimResult::default());
+                        maybe_claims.push(None);
                         continue;
                     }
                     Some(a) => a,
@@ -410,7 +430,7 @@ impl Actor {
                         "invalid sector {:?} for allocation {}",
                         claim_alloc.sector, claim_alloc.allocation_id,
                     );
-                    sector_claims.push(SectorAllocationClaimResult::default());
+                    maybe_claims.push(None);
                     continue;
                 }
 
@@ -426,7 +446,7 @@ impl Actor {
                 };
 
                 let inserted = claims
-                    .put_if_absent(provider, claim_alloc.allocation_id, new_claim)
+                    .put_if_absent(provider, claim_alloc.allocation_id, new_claim.clone())
                     .context_code(
                         ExitCode::USR_ILLEGAL_STATE,
                         format!("failed to write claim {}", claim_alloc.allocation_id),
@@ -437,7 +457,7 @@ impl Actor {
                         "claim for allocation {} could not be inserted as it already exists",
                         claim_alloc.allocation_id,
                     );
-                    sector_claims.push(SectorAllocationClaimResult::default());
+                    maybe_claims.push(None);
                     continue;
                 }
 
@@ -446,27 +466,46 @@ impl Actor {
                     format!("failed to remove allocation {}", claim_alloc.allocation_id),
                 )?;
 
-                total_datacap_claimed += DataCap::from(claim_alloc.size.0);
-                sector_claims
-                    .push(SectorAllocationClaimResult { claimed_space: claim_alloc.size.0.into() });
+                maybe_claims.push(Some((claim_alloc.allocation_id, new_claim)));
             }
             st.save_allocs(&mut allocs)?;
             st.save_claims(&mut claims)?;
             Ok(())
         })
         .context("state transaction failed")?;
-        if params.all_or_nothing && sector_claims.iter().any(|c| c.claimed_space.is_zero()) {
-            return Err(actor_error!(
-                illegal_argument,
-                "all or nothing call contained failures: {:?}",
-                sector_claims
-            ));
+
+        let mut datacap_claimed = DataCap::zero();
+        let mut results = Vec::with_capacity(maybe_claims.len());
+        let mut events = Vec::with_capacity(maybe_claims.len());
+        for maybe in maybe_claims.as_slice() {
+            match maybe {
+                None => {
+                    if params.all_or_nothing {
+                        return Err(actor_error!(
+                            illegal_argument,
+                            "all or nothing call contained failures: {:?}",
+                            maybe_claims
+                        ));
+                    }
+                    results.push(SectorAllocationClaimResult { claimed_space: DataCap::zero() });
+                }
+                Some((id, claim)) => {
+                    let datacap = DataCap::from(claim.size.0);
+                    datacap_claimed += &datacap;
+                    results.push(SectorAllocationClaimResult {
+                        claimed_space: datacap,
+                    });
+                    events.push(ClaimEvent{ id: *id, claim: claim.clone() });
+                }
+            }
         }
 
         // Burn the datacap tokens from verified registry's own balance.
-        burn(rt, &total_datacap_claimed)?;
+        burn(rt, &datacap_claimed)?;
 
-        Ok(ClaimAllocationsReturn { claim_results: sector_claims })
+        emit_event(rt, "Claim", &events)?;
+
+        Ok(ClaimAllocationsReturn { claim_results: results })
     }
 
     // get claims for a provider
@@ -1073,6 +1112,21 @@ fn can_claim_alloc(
         && curr_epoch <= alloc.expiration
         && sector_lifetime >= alloc.term_min
         && sector_lifetime <= alloc.term_max
+}
+
+// Emits a sequence of events sharing a single key.
+fn emit_event<T: Serialize>(rt: &impl Runtime, key: &str, values: &[T]) -> Result<(), ActorError> {
+    // This conversion would be more straightforward if try_map existed.
+    let mut entries = Vec::with_capacity(values.len());
+    for v in values {
+        entries.push(Entry {
+            flags: Flags::FLAG_INDEXED_KEY, // XXX or both?
+            key: key.to_owned(),
+            codec: IPLD_RAW, // XXX cbor?
+            value: serialize(v, "event payload")?.into(),
+        })
+    }
+    rt.emit_event(&ActorEvent { entries })
 }
 
 impl ActorCode for Actor {
