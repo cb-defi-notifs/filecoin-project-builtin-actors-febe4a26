@@ -1,17 +1,17 @@
 [package]
 name = "fil_actors_evm_shared"
 description = "Shared libraries for the built-in EVM actor for Filecoin"
-version = "12.0.0"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
 authors = ["Protocol Labs", "Filecoin Core Devs"]
-edition = "2021"
-repository = "https://github.com/filecoin-project/builtin-actors"
 keywords = ["filecoin", "web3", "wasm", "evm"]
 
 [dependencies]
-serde = { version = "1.0.136", features = ["derive"] }
-fvm_shared = { version = "3.2.0", default-features = false }
-fil_actors_runtime = { version = "12.0.0", path = "../../../runtime" }
-fvm_ipld_encoding = "0.3.3"
-uint = { version = "0.9.3", default-features = false }
-hex = "0.4.3"
+serde = { workspace = true }
+fvm_shared = { workspace = true }
+fil_actors_runtime = { workspace = true }
+fvm_ipld_encoding = { workspace = true }
+uint = { workspace = true }
+hex = { workspace = true }

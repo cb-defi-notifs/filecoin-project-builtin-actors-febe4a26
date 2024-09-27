@@ -5,10 +5,10 @@ use fil_actors_runtime::runtime::Policy;
 use fil_actors_runtime::Array;
 
 use fvm_ipld_blockstore::Blockstore;
-use fvm_shared::clock::{ChainEpoch, QuantSpec};
+use fvm_shared::clock::ChainEpoch;
 use fvm_shared::sector::SectorNumber;
 
-use super::{DeadlineInfo, Deadlines, Partition};
+use super::{DeadlineInfo, Deadlines, Partition, QuantSpec};
 
 pub fn new_deadline_info(
     policy: &Policy,
@@ -33,13 +33,12 @@ impl Deadlines {
     /// Returns an error if the sector number is not tracked by `self`.
     pub fn find_sector<BS: Blockstore>(
         &self,
-        policy: &Policy,
         store: &BS,
         sector_number: SectorNumber,
     ) -> anyhow::Result<(u64, u64)> {
         for i in 0..self.due.len() {
             let deadline_idx = i as u64;
-            let deadline = self.load_deadline(policy, store, deadline_idx)?;
+            let deadline = self.load_deadline(store, deadline_idx)?;
             let partitions = Array::<Partition, _>::load(&deadline.partitions, store)?;
 
             let mut partition_idx = None;

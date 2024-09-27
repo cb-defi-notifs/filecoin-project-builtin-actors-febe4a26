@@ -30,8 +30,7 @@ fn recovery_happy_path() {
 
     // Declare recoveries updates state
     let st = h.get_state(&rt);
-    let (dl_idx, p_idx) =
-        st.find_sector(&rt.policy, &rt.store, one_sector[0].sector_number).unwrap();
+    let (dl_idx, p_idx) = st.find_sector(&rt.store, one_sector[0].sector_number).unwrap();
     h.declare_recoveries(
         &rt,
         dl_idx,
@@ -62,10 +61,9 @@ fn recovery_must_pay_back_fee_debt() {
     h.declare_faults(&rt, &one_sector);
 
     st = h.get_state(&rt);
-    let (dl_idx, p_idx) =
-        st.find_sector(&rt.policy, &rt.store, one_sector[0].sector_number).unwrap();
+    let (dl_idx, p_idx) = st.find_sector(&rt.store, one_sector[0].sector_number).unwrap();
 
-    // Skip to end of proving period
+    // advance into the deadline but not past it
     h.advance_to_deadline(&rt, dl_idx);
 
     // Can't pay during this deadline so miner goes into fee debt
@@ -135,6 +133,7 @@ fn recovery_fails_during_active_consensus_fault() {
             epoch: epoch - 1,
             fault_type: ConsensusFaultType::DoubleForkMining,
         }),
+        ExitCode::OK,
     )
     .unwrap();
 
@@ -144,8 +143,7 @@ fn recovery_fails_during_active_consensus_fault() {
     // Declare the sector as faulted
     h.declare_faults(&rt, &one_sector);
     let st = h.get_state(&rt);
-    let (dl_idx, p_idx) =
-        st.find_sector(&rt.policy, &rt.store, one_sector[0].sector_number).unwrap();
+    let (dl_idx, p_idx) = st.find_sector(&rt.store, one_sector[0].sector_number).unwrap();
     expect_abort_contains_message(
         ExitCode::USR_FORBIDDEN,
         "recovery not allowed during active consensus fault",

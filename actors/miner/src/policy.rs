@@ -11,9 +11,7 @@ use fvm_shared::bigint::{BigInt, Integer};
 use fvm_shared::clock::ChainEpoch;
 use fvm_shared::commcid::{FIL_COMMITMENT_SEALED, POSEIDON_BLS12_381_A1_FC1};
 use fvm_shared::econ::TokenAmount;
-use fvm_shared::sector::{
-    RegisteredPoStProof, RegisteredSealProof, SectorQuality, SectorSize, StoragePower,
-};
+use fvm_shared::sector::{RegisteredPoStProof, RegisteredSealProof, SectorSize, StoragePower};
 use lazy_static::lazy_static;
 
 use super::types::SectorOnChainInfo;
@@ -22,15 +20,16 @@ use super::{PowerPair, BASE_REWARD_FOR_DISPUTED_WINDOW_POST};
 /// Precision used for making QA power calculations
 pub const SECTOR_QUALITY_PRECISION: i64 = 20;
 
+/// Base number of sectors before imposing the additional aggregate fee in ProveCommitSectorsNI
+pub const NI_AGGREGATE_FEE_BASE_SECTOR_COUNT: usize = 5;
+
 lazy_static! {
     /// Quality multiplier for committed capacity (no deals) in a sector
     pub static ref QUALITY_BASE_MULTIPLIER: BigInt = BigInt::from(10);
 
-    /// Quality multiplier for unverified deals in a sector
-    pub static ref DEAL_WEIGHT_MULTIPLIER: BigInt = BigInt::from(10);
-
     /// Quality multiplier for verified deals in a sector
     pub static ref VERIFIED_DEAL_WEIGHT_MULTIPLIER: BigInt = BigInt::from(100);
+
 }
 
 /// The maximum number of partitions that may be required to be loaded in a single invocation,
@@ -53,45 +52,13 @@ pub fn can_pre_commit_seal_proof(policy: &Policy, proof: RegisteredSealProof) ->
     policy.valid_pre_commit_proof_type.contains(proof)
 }
 
+pub fn can_prove_commit_ni_seal_proof(policy: &Policy, proof: RegisteredSealProof) -> bool {
+    policy.valid_prove_commit_ni_proof_type.contains(proof)
+}
+
 /// Checks whether a seal proof type is supported for new miners and sectors.
 pub fn can_extend_seal_proof_type(_proof: RegisteredSealProof) -> bool {
     true
-}
-
-/// Convert the v1_1 PoSt Proof type to the older v1 types (used in nv18 and below)
-pub fn convert_window_post_proof_v1p1_to_v1(
-    rpp: RegisteredPoStProof,
-) -> Result<RegisteredPoStProof, String> {
-    match rpp {
-        RegisteredPoStProof::StackedDRGWindow2KiBV1P1 => {
-            Ok(RegisteredPoStProof::StackedDRGWindow2KiBV1)
-        }
-        RegisteredPoStProof::StackedDRGWindow8MiBV1P1 => {
-            Ok(RegisteredPoStProof::StackedDRGWindow8MiBV1)
-        }
-        RegisteredPoStProof::StackedDRGWindow512MiBV1P1 => {
-            Ok(RegisteredPoStProof::StackedDRGWindow512MiBV1)
-        }
-        RegisteredPoStProof::StackedDRGWindow32GiBV1P1 => {
-            Ok(RegisteredPoStProof::StackedDRGWindow32GiBV1)
-        }
-        RegisteredPoStProof::StackedDRGWindow64GiBV1P1 => {
-            Ok(RegisteredPoStProof::StackedDRGWindow64GiBV1)
-        }
-        i => Err(format!("not a v1p1 proof type: {:?}", i)),
-    }
-}
-
-/// Convert the v1_1 PoSt Proof type to the older v1 types (used in nv18 and below)
-pub fn is_window_post_proof_v1p1(rpp: RegisteredPoStProof) -> bool {
-    matches!(
-        rpp,
-        RegisteredPoStProof::StackedDRGWindow2KiBV1P1
-            | RegisteredPoStProof::StackedDRGWindow8MiBV1P1
-            | RegisteredPoStProof::StackedDRGWindow512MiBV1P1
-            | RegisteredPoStProof::StackedDRGWindow32GiBV1P1
-            | RegisteredPoStProof::StackedDRGWindow64GiBV1P1
-    )
 }
 
 /// Maximum duration to allow for the sealing process for seal algorithms.
@@ -104,8 +71,18 @@ pub fn max_prove_commit_duration(
     match proof {
         StackedDRG32GiBV1 | StackedDRG2KiBV1 | StackedDRG8MiBV1 | StackedDRG512MiBV1
         | StackedDRG64GiBV1 => Some(EPOCHS_IN_DAY + policy.pre_commit_challenge_delay),
-        StackedDRG32GiBV1P1 | StackedDRG64GiBV1P1 | StackedDRG512MiBV1P1 | StackedDRG8MiBV1P1
-        | StackedDRG2KiBV1P1 => Some(30 * EPOCHS_IN_DAY + policy.pre_commit_challenge_delay),
+        StackedDRG32GiBV1P1
+        | StackedDRG64GiBV1P1
+        | StackedDRG512MiBV1P1
+        | StackedDRG8MiBV1P1
+        | StackedDRG2KiBV1P1
+        | StackedDRG32GiBV1P1_Feat_SyntheticPoRep
+        | StackedDRG64GiBV1P1_Feat_SyntheticPoRep
+        | StackedDRG512MiBV1P1_Feat_SyntheticPoRep
+        | StackedDRG8MiBV1P1_Feat_SyntheticPoRep
+        | StackedDRG2KiBV1P1_Feat_SyntheticPoRep => {
+            Some(30 * EPOCHS_IN_DAY + policy.pre_commit_challenge_delay)
+        }
         _ => None,
     }
 }
@@ -117,8 +94,21 @@ pub fn seal_proof_sector_maximum_lifetime(proof: RegisteredSealProof) -> Option<
     match proof {
         StackedDRG32GiBV1 | StackedDRG2KiBV1 | StackedDRG8MiBV1 | StackedDRG512MiBV1
         | StackedDRG64GiBV1 => Some(EPOCHS_IN_DAY * 540),
-        StackedDRG32GiBV1P1 | StackedDRG2KiBV1P1 | StackedDRG8MiBV1P1 | StackedDRG512MiBV1P1
-        | StackedDRG64GiBV1P1 => Some(EPOCHS_IN_YEAR * 5),
+        StackedDRG32GiBV1P1
+        | StackedDRG2KiBV1P1
+        | StackedDRG8MiBV1P1
+        | StackedDRG512MiBV1P1
+        | StackedDRG64GiBV1P1
+        | StackedDRG32GiBV1P1_Feat_SyntheticPoRep
+        | StackedDRG2KiBV1P1_Feat_SyntheticPoRep
+        | StackedDRG8MiBV1P1_Feat_SyntheticPoRep
+        | StackedDRG512MiBV1P1_Feat_SyntheticPoRep
+        | StackedDRG64GiBV1P1_Feat_SyntheticPoRep
+        | StackedDRG32GiBV1P2_Feat_NiPoRep
+        | StackedDRG2KiBV1P2_Feat_NiPoRep
+        | StackedDRG8MiBV1P2_Feat_NiPoRep
+        | StackedDRG512MiBV1P2_Feat_NiPoRep
+        | StackedDRG64GiBV1P2_Feat_NiPoRep => Some(EPOCHS_IN_YEAR * 5),
         _ => None,
     }
 }
@@ -126,28 +116,23 @@ pub fn seal_proof_sector_maximum_lifetime(proof: RegisteredSealProof) -> Option<
 /// minimum number of epochs past the current epoch a sector may be set to expire
 pub const MIN_SECTOR_EXPIRATION: i64 = 180 * EPOCHS_IN_DAY;
 
-/// DealWeight and VerifiedDealWeight are spacetime occupied by regular deals and verified deals in a sector.
-/// Sum of DealWeight and VerifiedDealWeight should be less than or equal to total SpaceTime of a sector.
-/// Sectors full of VerifiedDeals will have a SectorQuality of VerifiedDealWeightMultiplier/QualityBaseMultiplier.
-/// Sectors full of Deals will have a SectorQuality of DealWeightMultiplier/QualityBaseMultiplier.
-/// Sectors with neither will have a SectorQuality of QualityBaseMultiplier/QualityBaseMultiplier.
-/// SectorQuality of a sector is a weighted average of multipliers based on their proportions.
+/// VerifiedDealWeight is spacetime occupied by verified pieces in a sector.
+/// VerifiedDealWeight should be less than or equal to total SpaceTime of a sector.
+/// Sectors full of VerifiedDeals will have a BigInt of VerifiedDealWeightMultiplier/QualityBaseMultiplier.
+/// Sectors without VerifiedDeals will have a BigInt of QualityBaseMultiplier/QualityBaseMultiplier.
+/// BigInt of a sector is a weighted average of multipliers based on their proportions.
 pub fn quality_for_weight(
     size: SectorSize,
     duration: ChainEpoch,
-    deal_weight: &DealWeight,
     verified_weight: &DealWeight,
-) -> SectorQuality {
+) -> BigInt {
     let sector_space_time = BigInt::from(size as u64) * BigInt::from(duration);
-    let total_deal_space_time = deal_weight + verified_weight;
 
     let weighted_base_space_time =
-        (&sector_space_time - total_deal_space_time) * &*QUALITY_BASE_MULTIPLIER;
-    let weighted_deal_space_time = deal_weight * &*DEAL_WEIGHT_MULTIPLIER;
+        (&sector_space_time - verified_weight) * &*QUALITY_BASE_MULTIPLIER;
     let weighted_verified_space_time = verified_weight * &*VERIFIED_DEAL_WEIGHT_MULTIPLIER;
-    let weighted_sum_space_time =
-        weighted_base_space_time + weighted_deal_space_time + weighted_verified_space_time;
-    let scaled_up_weighted_sum_space_time: SectorQuality =
+    let weighted_sum_space_time = weighted_base_space_time + weighted_verified_space_time;
+    let scaled_up_weighted_sum_space_time: BigInt =
         weighted_sum_space_time << SECTOR_QUALITY_PRECISION;
 
     scaled_up_weighted_sum_space_time
@@ -165,17 +150,20 @@ pub fn qa_power_max(size: SectorSize) -> StoragePower {
 pub fn qa_power_for_weight(
     size: SectorSize,
     duration: ChainEpoch,
-    deal_weight: &DealWeight,
     verified_weight: &DealWeight,
 ) -> StoragePower {
-    let quality = quality_for_weight(size, duration, deal_weight, verified_weight);
+    let quality = quality_for_weight(size, duration, verified_weight);
     (BigInt::from(size as u64) * quality) >> SECTOR_QUALITY_PRECISION
 }
 
 /// Returns the quality-adjusted power for a sector.
 pub fn qa_power_for_sector(size: SectorSize, sector: &SectorOnChainInfo) -> StoragePower {
     let duration = sector.expiration - sector.power_base_epoch;
-    qa_power_for_weight(size, duration, &sector.deal_weight, &sector.verified_deal_weight)
+    qa_power_for_weight(size, duration, &sector.verified_deal_weight)
+}
+
+pub fn raw_power_for_sector(size: SectorSize) -> StoragePower {
+    BigInt::from(size as u64)
 }
 
 /// Determine maximum number of deal miner's sector can hold

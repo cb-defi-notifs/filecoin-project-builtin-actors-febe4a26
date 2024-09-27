@@ -1,38 +1,16 @@
 use std::cell::RefCell;
 
 use cid::Cid;
-use fil_actor_power::detail::GAS_ON_SUBMIT_VERIFY_SEAL;
-use fil_actor_power::ext::miner::ConfirmSectorProofsParams;
-use fil_actor_power::ext::miner::CONFIRM_SECTOR_PROOFS_VALID_METHOD;
-use fil_actor_power::ext::reward::Method::ThisEpochReward;
-use fil_actor_power::ext::reward::UPDATE_NETWORK_KPI;
-use fil_actor_power::testing::check_state_invariants;
-use fil_actor_power::EnrollCronEventParams;
-use fil_actor_power::CRON_QUEUE_AMT_BITWIDTH;
-use fil_actor_power::CRON_QUEUE_HAMT_BITWIDTH;
-use fil_actor_power::{epoch_key, MinerCountReturn};
-use fil_actor_power::{CronEvent, MinerConsensusCountReturn};
-use fil_actors_runtime::runtime::RuntimePolicy;
-use fil_actors_runtime::test_utils::CRON_ACTOR_CODE_ID;
-use fil_actors_runtime::Multimap;
-use fil_actors_runtime::CRON_ACTOR_ADDR;
-use fil_actors_runtime::REWARD_ACTOR_ADDR;
 use fvm_ipld_blockstore::Blockstore;
+use fvm_ipld_encoding::ipld_block::IpldBlock;
 use fvm_ipld_encoding::{BytesDe, RawBytes};
-use fvm_ipld_hamt::BytesKey;
-use fvm_ipld_hamt::Error;
 use fvm_shared::address::Address;
-use fvm_shared::bigint::bigint_ser::BigIntDe;
 use fvm_shared::bigint::bigint_ser::BigIntSer;
 use fvm_shared::bigint::BigInt;
 use fvm_shared::clock::ChainEpoch;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ExitCode;
-use fvm_shared::reward::ThisEpochRewardReturn;
-use fvm_shared::sector::SealVerifyInfo;
-use fvm_shared::sector::SectorNumber;
 use fvm_shared::sector::{RegisteredPoStProof, RegisteredSealProof, StoragePower};
-use fvm_shared::smooth::FilterEstimate;
 use fvm_shared::MethodNum;
 use lazy_static::lazy_static;
 use num_traits::Zero;
@@ -41,21 +19,32 @@ use serde::Serialize;
 
 use fil_actor_power::ext::init::ExecParams;
 use fil_actor_power::ext::miner::MinerConstructorParams;
+use fil_actor_power::ext::reward::Method::ThisEpochReward;
+use fil_actor_power::ext::reward::UPDATE_NETWORK_KPI;
+use fil_actor_power::testing::check_state_invariants;
+use fil_actor_power::EnrollCronEventParams;
+use fil_actor_power::CRON_QUEUE_AMT_BITWIDTH;
+use fil_actor_power::CRON_QUEUE_HAMT_BITWIDTH;
+use fil_actor_power::{epoch_key, MinerCountReturn};
 use fil_actor_power::{
     ext, Claim, CreateMinerParams, CreateMinerReturn, CurrentTotalPowerReturn, Method, State,
     UpdateClaimedPowerParams,
 };
-use fil_actors_runtime::builtin::HAMT_BIT_WIDTH;
+use fil_actor_power::{CronEvent, MinerConsensusCountReturn};
+use fil_actors_runtime::builtin::reward::{FilterEstimate, ThisEpochRewardReturn};
 use fil_actors_runtime::runtime::builtins::Type;
 use fil_actors_runtime::runtime::Runtime;
+use fil_actors_runtime::runtime::RuntimePolicy;
+use fil_actors_runtime::test_utils::CRON_ACTOR_CODE_ID;
 use fil_actors_runtime::test_utils::{
     MockRuntime, ACCOUNT_ACTOR_CODE_ID, MINER_ACTOR_CODE_ID, SYSTEM_ACTOR_CODE_ID,
 };
+use fil_actors_runtime::REWARD_ACTOR_ADDR;
 use fil_actors_runtime::{
-    make_map_with_root_and_bitwidth, ActorError, Map, INIT_ACTOR_ADDR, STORAGE_POWER_ACTOR_ADDR,
-    SYSTEM_ACTOR_ADDR,
+    ActorError, INIT_ACTOR_ADDR, STORAGE_POWER_ACTOR_ADDR, SYSTEM_ACTOR_ADDR,
 };
-use fvm_ipld_encoding::ipld_block::IpldBlock;
+use fil_actors_runtime::{Map2, MapKey, Multimap};
+use fil_actors_runtime::{CRON_ACTOR_ADDR, DEFAULT_HAMT_CONFIG};
 
 use crate::PowerActor;
 
@@ -207,10 +196,8 @@ impl Harness {
 
     pub fn list_miners(&self, rt: &MockRuntime) -> Vec<Address> {
         let st: State = rt.get_state();
-        let claims: Map<_, Claim> =
-            make_map_with_root_and_bitwidth(&st.claims, rt.store(), HAMT_BIT_WIDTH).unwrap();
-        let keys = collect_keys(claims).unwrap();
-        keys.iter().map(|k| Address::from_bytes(k).unwrap()).collect::<Vec<_>>()
+        let claims = st.load_claims(rt.store()).unwrap();
+        collect_keys(claims).unwrap()
     }
 
     pub fn miner_count(&self, rt: &MockRuntime) -> i64 {
@@ -225,10 +212,6 @@ impl Harness {
         ret.miner_count
     }
 
-    pub fn this_epoch_baseline_power(&self) -> &StoragePower {
-        &self.this_epoch_baseline_power
-    }
-
     pub fn get_claim(&self, rt: &MockRuntime, miner: &Address) -> Option<Claim> {
         let st: State = rt.get_state();
         st.get_claim(rt.store(), miner).unwrap()
@@ -237,10 +220,8 @@ impl Harness {
     pub fn delete_claim(&mut self, rt: &MockRuntime, miner: &Address) {
         let mut state: State = rt.get_state();
 
-        let mut claims =
-            make_map_with_root_and_bitwidth::<_, Claim>(&state.claims, rt.store(), HAMT_BIT_WIDTH)
-                .unwrap();
-        claims.delete(&miner.to_bytes()).expect("Failed to delete claim");
+        let mut claims = state.load_claims(rt.store()).unwrap();
+        claims.delete(miner).expect("Failed to delete claim");
         state.claims = claims.flush().unwrap();
 
         rt.replace_state(&state);
@@ -409,34 +390,8 @@ impl Harness {
         rt: &MockRuntime,
         current_epoch: ChainEpoch,
         expected_raw_power: &StoragePower,
-        confirmed_sectors: Vec<ConfirmedSectorSend>,
-        infos: Vec<SealVerifyInfo>,
     ) {
         self.expect_query_network_info(rt);
-
-        let state: State = rt.get_state();
-
-        //expect sends for confirmed sectors
-        for sector in confirmed_sectors {
-            let param = ConfirmSectorProofsParams {
-                sectors: sector.sector_nums,
-                reward_smoothed: self.this_epoch_reward_smoothed.clone(),
-                reward_baseline_power: self.this_epoch_baseline_power.clone(),
-                quality_adj_power_smoothed: state.this_epoch_qa_power_smoothed.clone(),
-            };
-            rt.expect_send_simple(
-                sector.miner,
-                CONFIRM_SECTOR_PROOFS_VALID_METHOD,
-                IpldBlock::serialize_cbor(&param).unwrap(),
-                TokenAmount::zero(),
-                None,
-                ExitCode::new(0),
-            );
-        }
-
-        let verified_seals = batch_verify_default_output(&infos);
-        rt.expect_batch_verify_seals(infos, anyhow::Ok(verified_seals));
-
         // expect power sends to reward actor
         rt.expect_send_simple(
             REWARD_ACTOR_ADDR,
@@ -457,54 +412,24 @@ impl Harness {
         let state: State = rt.get_state();
         assert!(state.proof_validation_batch.is_none());
     }
-
-    pub fn submit_porep_for_bulk_verify(
-        &self,
-        rt: &MockRuntime,
-        miner_address: Address,
-        seal_info: SealVerifyInfo,
-        expect_success: bool,
-    ) -> Result<(), ActorError> {
-        if expect_success {
-            rt.expect_gas_charge(GAS_ON_SUBMIT_VERIFY_SEAL);
-        }
-        rt.expect_validate_caller_type(vec![Type::Miner]);
-        rt.set_caller(*MINER_ACTOR_CODE_ID, miner_address);
-        rt.call::<PowerActor>(
-            Method::SubmitPoRepForBulkVerify as u64,
-            IpldBlock::serialize_cbor(&seal_info).unwrap(),
-        )?;
-        rt.verify();
-        Ok(())
-    }
 }
-
-pub struct ConfirmedSectorSend {
-    pub miner: Address,
-    pub sector_nums: Vec<SectorNumber>,
-}
-
-pub fn batch_verify_default_output(infos: &[SealVerifyInfo]) -> Vec<bool> {
-    vec![true; infos.len()]
-}
-
 /// Collects all keys from a map into a vector.
-fn collect_keys<BS, V>(m: Map<BS, V>) -> Result<Vec<BytesKey>, Error>
+fn collect_keys<BS, K, V>(m: Map2<BS, K, V>) -> Result<Vec<K>, ActorError>
 where
     BS: Blockstore,
+    K: MapKey + Clone,
     V: DeserializeOwned + Serialize,
 {
     let mut ret_keys = Vec::new();
     m.for_each(|k, _| {
-        ret_keys.push(k.clone());
+        ret_keys.push(k);
         Ok(())
     })?;
-
     Ok(ret_keys)
 }
 
 pub fn verify_empty_map(rt: &MockRuntime, key: Cid) {
     let map =
-        make_map_with_root_and_bitwidth::<_, BigIntDe>(&key, &rt.store, HAMT_BIT_WIDTH).unwrap();
+        Map2::<_, Vec<u8>, Vec<u8>>::load(&rt.store, &key, DEFAULT_HAMT_CONFIG, "empty?").unwrap();
     map.for_each(|_key, _val| panic!("expected no keys")).unwrap();
 }

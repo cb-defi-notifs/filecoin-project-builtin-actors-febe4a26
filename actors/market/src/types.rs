@@ -17,7 +17,7 @@ use fvm_shared::piece::PaddedPieceSize;
 use fvm_shared::ActorID;
 
 use crate::Label;
-use fvm_shared::sector::RegisteredSealProof;
+use fvm_shared::sector::{RegisteredSealProof, SectorNumber};
 
 use super::deal::{ClientDealProposal, DealProposal, DealState};
 
@@ -54,10 +54,10 @@ pub struct GetBalanceReturn {
     pub locked: TokenAmount,
 }
 
-#[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
+#[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, PartialEq)] // Add Eq when BitField does
 pub struct OnMinerSectorsTerminateParams {
     pub epoch: ChainEpoch,
-    pub deal_ids: Vec<DealID>,
+    pub sectors: BitField,
 }
 
 #[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
@@ -71,16 +71,15 @@ pub struct PublishStorageDealsReturn {
     pub valid_deals: BitField,
 }
 
-// Changed since V2:
-// - Array of Sectors rather than just one
-// - Removed SectorStart
 #[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
 pub struct VerifyDealsForActivationParams {
+    /// Deals to verify, grouped by sector.
     pub sectors: Vec<SectorDeals>,
 }
 
 #[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
 pub struct SectorDeals {
+    pub sector_number: SectorNumber,
     pub sector_type: RegisteredSealProof,
     pub sector_expiry: ChainEpoch,
     pub deal_ids: Vec<DealID>,
@@ -88,40 +87,46 @@ pub struct SectorDeals {
 
 #[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
 pub struct VerifyDealsForActivationReturn {
-    pub sectors: Vec<SectorDealData>,
-}
-
-#[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq, Default)]
-pub struct SectorDealData {
-    /// Option::None signifies commitment to empty sector, meaning no deals.
-    pub commd: Option<Cid>,
+    // The unsealed CID computed from the deals specified for each sector.
+    // A None indicates no deals were specified.
+    pub unsealed_cids: Vec<Option<Cid>>,
 }
 
 #[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
-#[serde(transparent)]
 pub struct BatchActivateDealsParams {
+    /// Deals to activate, grouped by sector.
+    /// A failed deal activation will cause other deals in the same sector group to also fail,
+    /// but allow other sectors to proceed.
     pub sectors: Vec<SectorDeals>,
+    /// Requests computation of an unsealed CID for each sector from the provided deals.
+    pub compute_cid: bool,
 }
 
+// Information about a deal that has been activated.
 #[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
-pub struct VerifiedDealInfo {
+pub struct ActivatedDeal {
     pub client: ActorID,
-    pub allocation_id: AllocationID,
+    pub allocation_id: AllocationID, // NO_ALLOCATION_ID for unverified deals.
     pub data: Cid,
     pub size: PaddedPieceSize,
 }
 
+// Information about a sector-grouping of deals that have been activated.
 #[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
-pub struct DealActivation {
-    #[serde(with = "bigint_ser")]
-    pub nonverified_deal_space: BigInt,
-    pub verified_infos: Vec<VerifiedDealInfo>,
+pub struct SectorDealActivation {
+    /// Information about each deal activated.
+    pub activated: Vec<ActivatedDeal>,
+    /// Unsealed CID computed from the deals specified for the sector.
+    /// A None indicates no deals were specified, or the computation was not requested.
+    pub unsealed_cid: Option<Cid>,
 }
 
 #[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
 pub struct BatchActivateDealsResult {
+    /// Status of each sector grouping of deals.
     pub activation_results: BatchReturn,
-    pub activations: Vec<DealActivation>,
+    /// Activation information for the sector groups that were activated.
+    pub activations: Vec<SectorDealActivation>,
 }
 
 #[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
@@ -130,16 +135,6 @@ pub struct DealSpaces {
     pub deal_space: BigInt,
     #[serde(with = "bigint_ser")]
     pub verified_deal_space: BigInt,
-}
-
-#[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
-pub struct ComputeDataCommitmentParams {
-    pub inputs: Vec<SectorDataSpec>,
-}
-
-#[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
-pub struct ComputeDataCommitmentReturn {
-    pub commds: Vec<Cid>,
 }
 
 /// A specialization of a array to deals.
@@ -244,6 +239,15 @@ pub struct GetDealActivationReturn {
     pub terminated: ChainEpoch,
 }
 
+pub type GetDealSectorParams = DealQueryParams;
+
+#[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
+#[serde(transparent)]
+pub struct GetDealSectorReturn {
+    /// Sector number with the provider that has committed the deal.
+    pub sector: SectorNumber,
+}
+
 // Interface market clients can implement to receive notifications from builtin market
 pub const MARKET_NOTIFY_DEAL_METHOD: u64 = frc42_dispatch::method_hash!("MarketNotifyDeal");
 
@@ -252,4 +256,26 @@ pub struct MarketNotifyDealParams {
     #[serde(with = "strict_bytes")]
     pub proposal: Vec<u8>,
     pub deal_id: u64,
+}
+
+#[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone)]
+#[serde(transparent)]
+pub struct SettleDealPaymentsParams {
+    pub deal_ids: BitField,
+}
+
+#[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
+pub struct SettleDealPaymentsReturn {
+    /// Indicators of success or failure for each deal
+    pub results: BatchReturn,
+    /// Results for the deals that succesfully settled
+    pub settlements: Vec<DealSettlementSummary>,
+}
+
+#[derive(Serialize_tuple, Deserialize_tuple, Debug, Clone, Eq, PartialEq)]
+pub struct DealSettlementSummary {
+    /// Incremental amount of funds transferred from client to provider for deal payment
+    pub payment: TokenAmount,
+    /// Whether the deal has settled for the final time
+    pub completed: bool,
 }

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use cid::multihash::Code;
 use fil_actors_evm_shared::{address::EthAddress, uints::U256};
 use fil_actors_runtime::{
     actor_error, extract_send_result, runtime::EMPTY_ARR_CID, AsActorError, EAM_ACTOR_ID,
@@ -14,7 +15,6 @@ use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::{ErrorNumber, ExitCode};
 use fvm_shared::sys::SendFlags;
 use fvm_shared::{MethodNum, Response, IPLD_RAW, METHOD_SEND};
-use multihash::Code;
 
 use crate::state::{State, Tombstone};
 use crate::BytecodeHash;
@@ -191,11 +191,9 @@ impl<'r, RT: Runtime> System<'r, RT> {
         })
     }
 
-    pub fn increment_nonce(&mut self) -> u64 {
+    pub fn increment_nonce(&mut self) {
         self.saved_state_root = None;
-        let nonce = self.nonce;
         self.nonce = self.nonce.checked_add(1).unwrap();
-        nonce
     }
 
     /// Transfers funds to the receiver. This doesn't bother saving/reloading state.
@@ -319,6 +317,7 @@ impl<'r, RT: Runtime> System<'r, RT> {
         self.nonce = state.nonce;
         self.saved_state_root = Some(root);
         self.bytecode = Some(EvmBytecode::new(state.bytecode, state.bytecode_hash));
+        self.tombstone = state.tombstone;
         Ok(())
     }
 
